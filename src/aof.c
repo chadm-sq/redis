@@ -39,6 +39,7 @@
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <sys/param.h>
+#include <sys/mman.h>
 
 void aofUpdateCurrentSize(void);
 void aofClosePipes(void);
@@ -61,8 +62,19 @@ void aofClosePipes(void);
 
 typedef struct aofrwblock {
     unsigned long used, free;
-    char buf[AOF_RW_BUF_BLOCK_SIZE];
+    int mmap_fd;  /* -1 for using RAM not mmap */
+    char *buf_ptr;
 } aofrwblock;
+
+void aof_block_free_method(void* node_payload) {
+    aofrwblock* block = node_payload;
+    if (block->mmap_fd > 0) {
+        munmap(block->buf_ptr,AOF_RW_BUF_BLOCK_SIZE);
+        close(block->mmap_fd);
+    } else {
+        zfree(block->buf_ptr);
+    }
+}
 
 /* This function free the old AOF rewrite buffer if needed, and initialize
  * a fresh new one. It tests for server.aof_rewrite_buf_blocks equal to NULL
@@ -72,7 +84,7 @@ void aofRewriteBufferReset(void) {
         listRelease(server.aof_rewrite_buf_blocks);
 
     server.aof_rewrite_buf_blocks = listCreate();
-    listSetFreeMethod(server.aof_rewrite_buf_blocks,zfree);
+    listSetFreeMethod(server.aof_rewrite_buf_blocks,&aof_block_free_method);
 }
 
 /* Return the current size of the AOF rewrite buffer. */
@@ -111,9 +123,9 @@ void aofChildWriteDiffData(aeEventLoop *el, int fd, void *privdata, int mask) {
         }
         if (block->used > 0) {
             nwritten = write(server.aof_pipe_write_data_to_child,
-                             block->buf,block->used);
+                             block->buf_ptr,block->used);
             if (nwritten <= 0) return;
-            memmove(block->buf,block->buf+nwritten,block->used-nwritten);
+            memmove(block->buf_ptr,block->buf_ptr+nwritten,block->used-nwritten);
             block->used -= nwritten;
             block->free += nwritten;
         }
@@ -132,7 +144,7 @@ void aofRewriteBufferAppend(unsigned char *s, unsigned long len) {
         if (block) {
             unsigned long thislen = (block->free < len) ? block->free : len;
             if (thislen) {  /* The current block is not already full. */
-                memcpy(block->buf+block->used, s, thislen);
+                memcpy(block->buf_ptr+block->used, s, thislen);
                 block->used += thislen;
                 block->free -= thislen;
                 s += thislen;
@@ -142,8 +154,28 @@ void aofRewriteBufferAppend(unsigned char *s, unsigned long len) {
 
         if (len) { /* First block to allocate, or need another block. */
             int numblocks;
-
             block = zmalloc(sizeof(*block));
+
+            /* Payload of the block could be on disk or in RAM. */
+            int fd = -1;
+            //if (server.aof_rewrites_queues_use_disk) {
+            if (1) {
+	        fd = open("aof-queue",O_RDWR|O_CREAT|O_EXCL,0644);
+                if (fd >= 0) {
+                    ftruncate(fd, AOF_RW_BUF_BLOCK_SIZE);
+                    unlink("aof-queue");  /* Remove name on disk space for automatic cleanup after fd close. */
+                } else {
+                    serverLog(LL_WARNING,"Background AOF disk buffer size failed excl create. Using RAM.");
+                }
+            }
+            if (fd >= 0) {  /* Disk space is allocated */
+                block->buf_ptr = mmap(NULL,AOF_RW_BUF_BLOCK_SIZE,PROT_READ|PROT_WRITE,MAP_PRIVATE,fd,0);
+                block->mmap_fd = fd;
+            } else {  /* Using RAM instead. */
+                block->buf_ptr = zmalloc(AOF_RW_BUF_BLOCK_SIZE);
+                block->mmap_fd = -1;
+            }
+
             block->free = AOF_RW_BUF_BLOCK_SIZE;
             block->used = 0;
             listAddNodeTail(server.aof_rewrite_buf_blocks,block);
@@ -182,7 +214,7 @@ ssize_t aofRewriteBufferWrite(int fd) {
         ssize_t nwritten;
 
         if (block->used) {
-            nwritten = write(fd,block->buf,block->used);
+            nwritten = write(fd,block->buf_ptr,block->used);
             if (nwritten != (ssize_t)block->used) {
                 if (nwritten == 0) errno = EIO;
                 return -1;
